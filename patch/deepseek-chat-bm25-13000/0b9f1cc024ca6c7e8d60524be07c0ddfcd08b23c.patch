@@ -1,0 +1,69 @@
+Looking at the issue, the problem is related to a regression introduced by commit d77067d08a3f56dc2d0e6c95bd2852c943df743a, which added dominating condition support in computeKnownBits(). The issue manifests when compiling with `-fno-inline -mllvm -unroll-full-max-count=1`, causing the function `func()` to incorrectly return `&GlobIntZERO` instead of `&GlobIntONE`.
+
+The issue likely involves incorrect value tracking or known bits computation that leads to misoptimization. Specifically, the problem might be in how `computeKnownBits()` handles dominating conditions when unrolling is limited.
+
+After analyzing the code, the issue is likely in `ValueTracking.cpp` where `computeKnownBits()` was modified to use dominating conditions. The problem might be that when unrolling is limited, the dominating condition analysis incorrectly determines that certain values are known, leading to wrong code generation.
+
+The fix should ensure that when computing known bits with dominating conditions, we properly handle cases where the condition might not dominate all uses after transformations like partial unrolling.
+
+Here's the patch:
+
+```code
+diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp
+--- a/llvm/lib/Analysis/ValueTracking.cpp
++++ b/llvm/lib/Analysis/ValueTracking.cpp
+@@ -7538,6 +7538,12 @@ static void computeKnownBitsFromContext(
+     return;
+   }
+ 
++  // If we're in a loop that has been partially unrolled, be conservative
++  // about using dominating conditions from outside the loop body.
++  if (CxtI && CxtI->getParent() && CxtI->getParent()->getParent()) {
++    if (LI && LI->getLoopFor(CxtI->getParent()))
++      return;
++  }
++
+   // Try to use dominating conditions.
+   if (DT) {
+     for (unsigned i = 0, e = NumCxtCases; i != e; ++i) {
+```
+
+However, this approach might be too conservative. Let me look at the actual implementation more carefully. The issue is likely that when we have partial unrolling, the dominating condition analysis might incorrectly assume conditions hold in unrolled iterations where they don't.
+
+Actually, looking more closely at the commit that introduced the regression, the issue might be in how we handle conditions that dominate through loops. When we have `-unroll-full-max-count=1`, we get partial unrolling which might break the dominance relationship that the code assumes.
+
+A better fix would be to check if the context instruction is in a loop and the condition comes from outside the loop. In that case, we shouldn't use the dominating condition because it might not hold for all iterations after unrolling.
+
+Let me revise the patch:
+
+```code
+diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp
+--- a/llvm/lib/Analysis/ValueTracking.cpp
++++ b/llvm/lib/Analysis/ValueTracking.cpp
+@@ -7538,6 +7538,20 @@ static void computeKnownBitsFromContext(
+     return;
+   }
+ 
++  // Don't use dominating conditions from outside loops when the context
++  // instruction is inside a loop, as these conditions might not hold for
++  // all iterations after transformations like partial unrolling.
++  if (CxtI && CxtI->getParent() && CxtI->getParent()->getParent()) {
++    if (LI) {
++      const Loop *CxtLoop = LI->getLoopFor(CxtI->getParent());
++      for (unsigned i = 0, e = NumCxtCases; i != e; ++i) {
++        const BasicBlock *CxtBB = Context[i].BB;
++        const Loop *CondLoop = LI->getLoopFor(CxtBB);
++        if (CxtLoop && (!CondLoop || !CxtLoop->contains(CondLoop)))
++          return;
++      }
++    }
++  }
++
+   // Try to use dominating conditions.
+   if (DT) {
+     for (unsigned i = 0, e = NumCxtCases; i != e; ++i) {
+```
+
+This patch checks if the context instruction is in a loop, and if any of the condition blocks are either not in a loop or in an outer loop relative to the context instruction's loop. In such cases, we avoid using the dominating condition information because after transformations like partial unrolling, the condition might not dominate all uses within the loop body.
+
+This should fix the issue where after partial unrolling with `-unroll-full-max-count=1`, the dominating condition analysis incorrectly assumes conditions hold that actually don't, leading to the wrong return value from `func()`.
